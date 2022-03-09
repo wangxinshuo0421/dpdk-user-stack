@@ -30,7 +30,7 @@ extern "C" {
 /**
  * IPv4 Header
  */
-struct rte_ipv4_hdr {
+struct rte_ipv4_h6dr {
 	uint8_t  version_ihl;		/**< version and header length */
 	uint8_t  type_of_service;	/**< type of service */
 	rte_be16_t total_length;	/**< length of packet */
