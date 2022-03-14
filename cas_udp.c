@@ -1,20 +1,42 @@
-#include "cas_upd.h"
-
 #include <stdio.h>
 #include <getopt.h>
 
+#include <rte_config.h>
+#include <rte_byteorder.h>
+#include <rte_memory.h>
+#include <rte_memzone.h>
+#include <rte_launch.h>
+#include <rte_tailq.h>
+#include <rte_eal.h>
+#include <rte_lcore.h>
+#include <rte_per_lcore.h>
+#include <rte_debug.h>
+#include <rte_ether.h>
+#include <rte_ethdev.h>
+#include <rte_ip.h>
+#include <rte_udp.h>
+#include <rte_branch_prediction.h>
+#include <rte_cycles.h>
+#include <rte_string_fns.h>
+#include <rte_log.h>
+#include <rte_mempool.h>
+
 /* linux kernel */
-#include <endian.h>     
+#ifdef RTE_EXEC_ENV_FREEBSD
+#include <sys/endian.h>
+#elif defined RTE_EXEC_ENV_LINUX
+#include <endian.h>
+#endif    
 
 #define INLINE inline __attribute__((always_inline))
 #define UNUSED __attribute__((unused))
+#define RTE_LOGTYPE_LSI RTE_LOGTYPE_USER1
 
 #define DIE(msg, ...)                                       \
     do {                                                    \
-        RTE_LOG(RTE_LOG_ERR, RTE_LOGTYPE_USER1, msg , ## __VA_ARGS__ );         \
+        RTE_LOG(ERR, LSI, msg , ## __VA_ARGS__ );         \
         exit(EXIT_FAILURE);                                 \
     } while (0)
-
 
 #define PKT_BURST               32
 #define MAX_PKT_BURST           32
@@ -69,21 +91,27 @@ struct psd_hdr{
     uint8_t  zero;
     uint8_t  proto;
     uint16_t len;
-} __attribuit__((__rte_packed));      //不对齐
+}  __rte_packed;         //不对齐
 
-static const struct rte_eth_conf port_conf = {
+/**
+ * IPv4 Header
+ */
+struct rte_ipv4_h6dr {
+	uint8_t  version_ihl;		/**< version and header length */
+	uint8_t  type_of_service;	/**< type of service */
+	rte_be16_t total_length;	/**< length of packet */
+	rte_be16_t packet_id;		/**< packet ID */
+	rte_be16_t fragment_offset;	/**< fragmentation offset */
+	uint8_t  time_to_live;		/**< time to live */
+	uint8_t  next_proto_id;		/**< protocol ID */
+	rte_be16_t hdr_checksum;	/**< header checksum */
+	rte_be32_t src_addr;		/**< source address */
+	rte_be32_t dst_addr;		/**< destination address */
+} __rte_packed;
+
+static const struct rte_eth_conf dev_conf = {
     .rxmode = {
-        .mq_mode        = ETH_MQ_RX_RSS,
         .max_rx_pkt_len = RTE_ETHER_MAX_LEN,
-        .split_hdr_size = 0,
-    },
-    .txmode = {
-    },
-    .rx_adv_conf = {
-        .rss_conf = {
-            .rss_hf = ETH_RSS_IP,
-            .rss_key = NULL,
-        }
     }
 };
 
@@ -127,12 +155,12 @@ static uint32_t              enabled_ports_mask = 0;
 static bool                  numa_on = false;
 static uint16_t              nb_rxd = RX_DESC_DEFAULT;
 static uint16_t              nb_txd = TX_DESC_DEFAULT;
-static struct lcore_conf     lcore_conf[RTE_MAX_LCORE_FREQS];                   /*there may be a problem !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!*/
+static struct lcore_conf     lcore_conf[RTE_MAX_LCORE];                   /*there may be a problem !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!*/
 static struct rte_mempool   *pktmbuf_pool[NUM_SOCKETS];
 static struct lcore_params   lcore_params_array[MAX_LCORE_PARAMS];
 static struct lcore_params   lcore_params_array_default[] = {{0, 0, 0},};
 static struct lcore_params  *lcore_params = lcore_params_array_default;
-static uint16_t              n_lcore_parms = sizeof(lcore_params_array_default) / sizeof(lcore_params_array_default[0]);
+static uint16_t              n_lcore_parms;
 
 /*
  * Return the CPU socket on which the given logical core resides.
@@ -169,7 +197,7 @@ static inline uint16_t csum_fold(uint32_t x){
 /*
  * Compute checksum of IPv4 pseudo-header.
  */
-static inline uint16_t ipv4_pseudo_csum(struct rte_ipv4_h6dr *ip){
+uint16_t ipv4_pseudo_csum(struct rte_ipv4_h6dr *ip){
     struct psd_hdr psd;
 
     psd.src_addr = ip->src_addr;
@@ -205,7 +233,7 @@ static void print_pkt_addr(int src_ip, int dst_ip, uint16_t src_port, uint16_t d
     b[10] = dst_port & 0xFF;
     b[11] = (dst_port >> 8) & 0xFF;
     dp = ((b[10] << 8) & 0xFF00) | (b[11] & 0x00FF);
-    RTE_LOG(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1,
+    RTE_LOG(DEBUG, LSI,
             "CAS: rx udp packet: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%d bytes)\n",
             b[0], b[1], b[2], b[3], sp,
             b[6], b[7], b[8], b[9], dp,
@@ -228,9 +256,9 @@ static inline int send_burst(struct lcore_conf *conf, uint16_t n, uint8_t port, 
             rte_pktmbuf_free(m_table[rsv]);
         }while(++rsv < n);
     }
-    RTE_LOG(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, 
-            "CAS: free count mempool socket %u: %u\n", 
-            socket, rte_mempool_free_t(pktmbuf_pool[socket]));
+    // RTE_LOG(DEBUG, LSI, 
+    //         "CAS: free count mempool socket %u: %u\n", 
+    //         socket, rte_mempool_free_count(pktmbuf_pool[socket]));
     return 0;
 }
 
@@ -278,14 +306,14 @@ static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt){
     }
     /* not support ipv6*/
     if(eth_type != RTE_ETHER_TYPE_IPV4){
-        RTE_LOG(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, 
+        RTE_LOG(DEBUG, LSI, 
                 "CAS: receive ipv6 packet, can't handle it\n");
         return 0;
     }
     ip_h = (struct rte_ipv4_h6dr *) ((char *) eth_h + l2_len);
     /* only support udp !!!!*/
     if(ip_h -> next_proto_id != IPPROTO_UDP){
-        RTE_LOG(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, 
+        RTE_LOG(DEBUG, LSI, 
                 "CAS: receive tcp packet, can't handle it\n");
         return 0;
     }
@@ -327,29 +355,33 @@ static int main_loop(UNUSED void *junk){
     conf = &lcore_conf[lcore_id];
     socket = socket_for_lcore(lcore_id);
     if(conf->n_rx_queue == 0){
-        RTE_LOG(RTE_LOG_INFO, RTE_LOGTYPE_USER1, 
+        RTE_LOG(INFO, LSI, 
                 "CAS: lcore %u not mapped into service\n", lcore_id);
         return 0;
     }
-    RTE_LOG(RTE_LOG_INFO, RTE_LOGTYPE_USER1, 
-            "CAS: starting service on lcore %u", lcore_id);
+    RTE_LOG(INFO, LSI, 
+            "CAS: starting service on lcore %u\n", lcore_id);
     for(i = 0; i < conf->n_rx_queue; i++){
         port = conf->rx_queues[i].port_id;
         queue = conf->rx_queues[i].queue_id;
-        RTE_LOG(RTE_LOG_INFO, RTE_LOGTYPE_USER1, 
+        RTE_LOG(INFO, LSI, 
                 "CAS: --- lcore = %u port = %u rx_queue = %u ---\n", 
                 lcore_id, port, queue);
-    }
+    }  
+    printf("in lcore %d; lcore_params: port_id:%d; queue_id:%d; lcore_id:%d \n", 
+            lcore_id, lcore_params[lcore_id].port_id, lcore_params[lcore_id].queue_id, lcore_params[lcore_id].lcore_id);
     /* cyclic processing port receive information */
     while (1){
-        for(i = 0; i < conf->n_rx_queue; i++){
+        for(i = 0; i < 1; i++){
             port = conf->rx_queues[i].port_id;
             queue = conf->rx_queues[i].queue_id;
             n_reply = 0;
             n_rx = rte_eth_rx_burst(port, queue, pkts_burst, PKT_BURST);
-            if(unlikely(n_rx == 0))
+            //printf("rx num = %d; rte_eth_rx_burst port:%d ; queue:%d\n",n_rx, port, queue);
+            if(n_rx == 0)
                 continue;
             for(i = 0; i < n_rx; i++){
+                printf("recv!!!!\n");
                 pkt = pkts_burst[i];
                 if(echo_single_udp_packet(pkt)){
                     send_one(conf, pkt, port, socket);
@@ -390,7 +422,7 @@ static void init_packet_buffer(unsigned num_mbuf){
     char        s[64];
     unsigned    lcore_id;
 
-    for(lcore_id = 0; lcore_id < RTE_MAX_LCORE_FREQS; lcore_id++){
+    for(lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++){
         if(!rte_lcore_is_enabled(lcore_id)){
             continue;
         }
@@ -419,15 +451,15 @@ static void init_tx_queue_for_port(uint8_t port){
     struct lcore_conf  *queue_conf;
 
     queue = 0;
-    for(lcore_id = 0; lcore_id < RTE_MAX_LCORE_FREQS; lcore_id++){
+    for(lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++){
         if(!rte_lcore_is_enabled(lcore_id)){
             continue;
         }
         socket_id = socket_for_lcore(lcore_id);
-        RTE_LOG(RTE_LOG_INFO, RTE_LOGTYPE_USER1, 
-                "CAS: initializing TX queue: (lcore %u, queue %u， socket %u)\n",
-                lcore_id, queue,socket_id);
-        if(rte_eth_tx_queue_setup(port, queue, nb_txd, socket_id, &tx_conf) != 0){
+        RTE_LOG(INFO, LSI, 
+                "CAS: initializing TX queue: (lcore %u, queue %u, socket %u)\n",
+                lcore_id, queue, socket_id);
+        if(rte_eth_tx_queue_setup(port, queue, nb_txd, socket_id, &tx_conf)){
             DIE("CAS: in function init_tx_queue_for_port(cas_udp.c) rte_eth_tx_queue_setup(%u) failed: port=%d queue=%d\n", lcore_id, port, queue);
         }
         queue_conf = &lcore_conf[lcore_id];
@@ -456,8 +488,8 @@ static void check_lcore_params(void){
         }
         socket_id = rte_lcore_to_socket_id(lcore);
         if(socket_id != 0 && !numa_on){
-            RTE_LOG(RTE_LOG_WARNING, RTE_LOGTYPE_USER1, 
-            "CAS: lcore %hhu is on socket %d with NUMA off \n", lcore);
+            RTE_LOG(WARNING, LSI, 
+            "CAS: lcore %hhu is on socket %d with NUMA off \n", lcore, socket_id);
         }
     }
 }
@@ -469,17 +501,18 @@ static void init_lcores(void){
     uint8_t     lcore;
     uint16_t    i,
                 n_rx_queue;
-    
+    printf("init lcores ing lcore = %d\n", rte_lcore_count());
     for(i = 0; i < n_lcore_parms; i++){
         lcore = lcore_params[i].lcore_id;
         n_rx_queue = lcore_conf[lcore].n_rx_queue;
+        printf("DEBUG: lcore id = %d ; n_rx_queue = %d \n", lcore, n_rx_queue);
         if(n_rx_queue >= MAX_RX_QUEUE_PER_LCORE){
             DIE("CAS: too man RX queues (%u) for lcore %u\n", (unsigned) n_rx_queue + 1, (unsigned) lcore);
         }
         /* there are some problems may be !!!!!!!!!!!!*/
         lcore_conf[lcore].rx_queues[n_rx_queue].port_id = lcore_params[i].port_id;
         lcore_conf[lcore].rx_queues[n_rx_queue].queue_id = lcore_params[i].queue_id;
-        lcore_conf[lcore].n_rx_queue++;
+        lcore_conf[lcore].n_rx_queue = 1;
     }
 }
 
@@ -495,24 +528,24 @@ static void configure_ports(unsigned n_ports, uint32_t port_mask, uint32_t n_lco
     struct rte_ether_addr   eth_addr;
 
     for(port_id = 0; port_id < n_ports; port_id++){
-        if(!(port_mask & (1 << port_id))){
-            RTE_LOG(RTE_LOG_INFO, RTE_LOGTYPE_USER1,
-                    "CAS: skipping disabled port %u\n", port_id);
-            continue;
-        }
-        n_rx_queue = rx_queue_for_port(port_id);
-        n_tx_queue = n_lcores;
+        // if(!(port_mask & (1 << port_id))){
+        //     RTE_LOG(INFO, LSI,
+        //             "CAS: skipping disabled port %u\n", port_id);
+        //     continue;
+        // }
+        n_rx_queue = 1;
+        n_tx_queue = 1;         // change there: n_tx_queue = n_lcore;
         if(n_tx_queue > MAX_TX_QUEUE_PER_PORT){
             n_tx_queue = MAX_TX_QUEUE_PER_PORT;
         }
-        RTE_LOG(RTE_LOG_INFO, RTE_LOGTYPE_USER1,
+        RTE_LOG(INFO, LSI,
                 "CAS: initializing port %u: %u rx, %u tx\n",
                 port_id, (uint16_t)n_rx_queue, n_tx_queue);
-        if((rsv = rte_eth_dev_configure(port_id, n_rx_queue, (uint16_t) n_tx_queue, &port_conf)) < 0){
+        if((rsv = rte_eth_dev_configure(port_id, n_rx_queue, (uint16_t) n_tx_queue, &dev_conf)) < 0){
             DIE("CAS: failed to configure Ethernet port %u\n", port_id);
         }
         rte_eth_macaddr_get(port_id, &eth_addr);
-        RTE_LOG(RTE_LOG_INFO, RTE_LOGTYPE_USER1,
+        RTE_LOG(INFO, LSI,
                 "port %u MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
                 port_id,
                 eth_addr.addr_bytes[0], eth_addr.addr_bytes[1], 
@@ -521,6 +554,7 @@ static void configure_ports(unsigned n_ports, uint32_t port_mask, uint32_t n_lco
         init_packet_buffer(NUM_MBUF(n_ports, n_rx_queue, n_tx_queue, n_lcores));
         init_tx_queue_for_port(port_id);
     }
+    RTE_LOG(INFO, LSI, "CAS: function configure_ports excute, n_port = %d, port_id = %u\n", n_ports, port_id);
 }
 
 /*
@@ -535,11 +569,125 @@ static void init_rx_queues(void){
     unsigned            lcore_id;
     struct lcore_conf  *lconf;
 
-    
+    for(lcore_id = 0; lcore_id < n_lcore_parms; lcore_id++){
+        if(!rte_lcore_is_enabled(lcore_id)){
+            printf("rte_lcore_is_disabled, lcore_id = %d\n",lcore_id);
+            continue;
+        }
+        socket_id = socket_for_lcore(lcore_id);
+        lconf = &lcore_conf[lcore_id];
+        RTE_LOG(INFO, LSI,
+                "CAS: initializing RX queue on lcore %u, n_rx_queue = % d\n",
+                lcore_id, lconf->n_rx_queue);
+        for(queue = 0; queue < 1; queue++){
+            port_id = lconf->rx_queues[queue].port_id;
+            queue_id = lconf->rx_queues[queue].queue_id;
+            RTE_LOG(INFO, LSI,
+                    "CAS: -- rx_queue: port = %u; queue = %u; socket = %u;\n", 
+                    port_id, queue_id, socket_id);
+            if((rsv = rte_eth_rx_queue_setup(port_id, queue_id, nb_rxd, socket_id, &rx_conf, pktmbuf_pool[socket_id]))){
+                DIE("CAS: rte_eth_rx_queue_setup failed: err = %d; port = %d; queue = %d; lcore = %d;\n",
+                    rsv, port_id, queue_id, lcore_id);
+            }
+        }
+    }
 }
 
-int main(int argc, char const *argv[])
+/*
+ * Start DPDK on all configured ports (Ethernet devices).
+ */
+static void start_ports(unsigned n_ports, uint32_t port_mask){
+    int     rsv;
+    uint8_t port_id;
+
+    for(port_id = 0; port_id < n_ports; port_id++){
+        if(!(port_mask & (1 << port_id))){
+            continue;
+        }
+        rte_eth_promiscuous_enable(port_id);
+        if((rsv = rte_eth_dev_start(port_id)) < 0){
+            DIE("CAS: RTE eth dev start failed: err = %d; port = %d\n", rsv, port_id);
+        }
+    }
+}
+
+/*
+ * Wait for all specified ports to show link UP.
+ */
+static void check_port_link_status(uint8_t n_ports, uint32_t port_mask){
+    uint8_t             port,
+                        count,
+                        all_ports_up;
+    struct rte_eth_link link;
+
+#define CHECK_INTERVAL  100 /* milliseconds */
+#define MAX_CHECK_TIME  90  /* 90 * 100ms = 9s */
+
+    for(count = 0; count <= MAX_CHECK_TIME; count++){
+        all_ports_up = 1;
+        for(port = 0; port < n_ports; port++){
+            if(!(port_mask & (1 << port))){
+                continue;
+            }
+            memset(&link, 0, sizeof(link));
+            rte_eth_link_get_nowait(port, &link);
+            if(link.link_status == 0){
+                all_ports_up = 0;
+                break;
+            }
+        }
+        if(all_ports_up) break;
+        rte_delay_ms(CHECK_INTERVAL);
+    }
+
+#undef CHECK_INTERVAL
+#undef MAX_CHECK_TIME
+}
+
+/*
+ * Parse enabled ports bitmask (to specify which Ethernet devices to use). On
+ * failure to parse the bitmask it will return -1, which, when interpreted as
+ * unsigned, will result in all bits on.
+ */
+static int parse_portmask(const char *arg){
+    char           *end = NULL;
+    unsigned long   mask;
+
+    mask = strtoul(arg, &end, 16);
+    if(!*arg || !end || !*end){
+        return -1;
+    }
+    return (!mask) ? -1 : mask;
+}
+
+/*
+ * Initialize
+ */
+static void init_nics(void){
+    unsigned n_ports;
+
+    check_lcore_params();
+    init_lcores();
+    if((n_ports = rte_eth_dev_count_avail()) == 0){
+        DIE("CAS: no Ethernet ports detected\n");
+    }
+    RTE_LOG(INFO, LSI,
+            "%u Ethernet ports detected\n", n_ports);
+    configure_ports(n_ports, enabled_ports_mask, rte_lcore_count());
+    init_rx_queues();
+    start_ports(n_ports, enabled_ports_mask);
+    check_port_link_status(n_ports, enabled_ports_mask);
+}
+
+int main(int argc, char **argv)
 {
     /* code */
+    if (rte_eal_init(argc, argv) < 0) {
+        rte_exit(EXIT_FAILURE, "Error with eal init \n");
+    }
+    n_lcore_parms = rte_lcore_count();
+    init_nics();
+    rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
+    rte_eal_mp_wait_lcore();
     return 0;
 }
