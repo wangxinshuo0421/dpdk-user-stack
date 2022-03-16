@@ -34,7 +34,7 @@
 
 #define DIE(msg, ...)                                       \
     do {                                                    \
-        RTE_LOG(ERR, LSI, msg , ## __VA_ARGS__ );         \
+        RTE_LOG(ERR, USER1, msg , ## __VA_ARGS__ );         \
         exit(EXIT_FAILURE);                                 \
     } while (0)
 
@@ -110,9 +110,32 @@ struct rte_ipv4_h6dr {
 	rte_be32_t dst_addr;		/**< destination address */
 } __rte_packed;
 
+static uint8_t intel_rss_key[40] =
+{
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A
+};
+
+/* 
+ * XXX: The below rte_eth_conf values are optimized for VMXNET3
+ * support up to 4 rx/tx queue
+ * using the DPDK igb_uio PMD
+ */
 static const struct rte_eth_conf dev_conf = {
     .rxmode = {
         .max_rx_pkt_len = RTE_ETHER_MAX_LEN,
+        .mq_mode = ETH_MQ_RX_RSS,           // Receive Side Scaling 根据端口的接收队列进行报文分发的。 例如我们在一个端口上配置了3个接收队列(0,1,2)并开启了RSS，那么(redirection table)就是这样的:{0,1,2,0,1,2,0.........}
+        .split_hdr_size = 0,
+        .offloads = 0,
+    },
+    .rx_adv_conf = {
+        .rss_conf = {
+            .rss_key = intel_rss_key,
+            /* rss_hf 要根据网卡支持的卸载协议进行配置 */
+            .rss_hf = ETH_RSS_NONFRAG_IPV6_TCP | ETH_RSS_IPV6 | ETH_RSS_NONFRAG_IPV4_TCP | ETH_RSS_IPV4 ,
+        }
     }
 };
 
@@ -205,7 +228,10 @@ uint16_t ipv4_pseudo_csum(struct rte_ipv4_h6dr *ip){
  * We can't include arpa/inet.h because our compiler options are too strict
  * for that shitty code. Thus, we have to do this here...
  */
-static void print_pkt_addr(int src_ip, int dst_ip, uint16_t src_port, uint16_t dst_port, int len)
+static void print_pkt(int src_ip, int dst_ip, 
+                      uint16_t src_port, uint16_t dst_port, 
+                      struct rte_udp_hdr * udp_hdr,
+                      int len, int lcore_id)
 {
     uint8_t     b[12];
     uint16_t    sp,
@@ -225,11 +251,14 @@ static void print_pkt_addr(int src_ip, int dst_ip, uint16_t src_port, uint16_t d
     b[10] = dst_port & 0xFF;
     b[11] = (dst_port >> 8) & 0xFF;
     dp = ((b[10] << 8) & 0xFF00) | (b[11] & 0x00FF);
-    RTE_LOG(INFO, LSI,
-            "CAS: rx udp packet: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%d bytes)\n",
+    *(char *)(udp_hdr + ntohs(udp_hdr->dgram_len)) = '\0';
+    if((sp == 10000 || sp == 60000))
+        RTE_LOG(INFO, LSI,
+            "CAS: lcore_id = %d rx udp packet: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%d bytes) data: %s\n",
+            lcore_id,
             b[0], b[1], b[2], b[3], sp,
             b[6], b[7], b[8], b[9], dp,
-            len);
+            len, (char *)(udp_hdr + 1));
 }
 
 /*
@@ -275,7 +304,7 @@ static inline int send_one(struct lcore_conf *conf, struct rte_mbuf *pkt, uint8_
 /*
  * Echoes back a single UDP packet to its origin.
  */
-static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt){
+static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt, int lcore_id){
     int                    l2_len;
     uint16_t               eth_type,
                            udp_port;
@@ -310,7 +339,8 @@ static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt){
         return 0;
     }
     udp_h = (struct rte_udp_hdr *) ((char *) ip_h + sizeof(*ip_h));
-    print_pkt_addr(ip_h->src_addr, ip_h->dst_addr, udp_h->src_port, udp_h->dst_port, pkt->data_len);
+    print_pkt(ip_h->src_addr, ip_h->dst_addr, udp_h->src_port, udp_h->dst_port, 
+               udp_h, pkt->data_len, lcore_id);
     /* swap the source and destination addresses/ports */
     rte_ether_addr_copy(&eth_h->s_addr, &eth_addr);
     rte_ether_addr_copy(&eth_h->d_addr, &eth_h->s_addr);
@@ -369,18 +399,18 @@ static int main_loop(void){
             port = conf->rx_queues[i].port_id;
             queue = conf->rx_queues[i].queue_id;
             n_reply = 0;
-            n_rx = rte_eth_rx_burst(0, 0, pkts_burst, PKT_BURST);
+            n_rx = rte_eth_rx_burst(port, queue, pkts_burst, PKT_BURST);
             if(n_rx == 0)
                 continue;
             for(i = 0; i < n_rx; i++){
                 //printf("recv!!!!\n");
                 pkt = pkts_burst[i];
-                if(echo_single_udp_packet(pkt)){
+                if(echo_single_udp_packet(pkt, lcore_id)){
                     send_one(conf, pkt, port, socket);
                     n_reply++;
-                } else {
-                    rte_pktmbuf_free(pkt);
-                }
+                } 
+                rte_pktmbuf_free(pkt);
+                
             }
             if(n_reply > 0){
                 send_burst(conf, conf->tx_mbufs[port].len, port, socket);
@@ -422,6 +452,7 @@ static void init_packet_buffer(unsigned num_mbuf){
         if(pktmbuf_pool[socketid] == NULL){
             pktmbuf_pool[socketid] = rte_pktmbuf_pool_create("mbuf pool", MBUF_SIZE,MEMPOOL_CACHE_SIZE, 
                                                             0, RTE_MBUF_DEFAULT_BUF_SIZE,rte_socket_id());
+            
             if(pktmbuf_pool[socketid] == NULL){
                 DIE("CAS: failed to allocate mbuf pool on socket %d\n", socketid);
             }
@@ -670,8 +701,7 @@ int main(int argc, char **argv){
     }
     n_lcore_parms = rte_lcore_count();
     init_nics();
-    main_loop();
-    // rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
-    // rte_eal_mp_wait_lcore();
+    rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
+    rte_eal_mp_wait_lcore();
     return 0;
 }
