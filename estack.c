@@ -59,6 +59,7 @@ void init_port(struct rte_mempool *mbuf_pool){
     if (rte_eth_rx_queue_setup(dpdk_port_id, 0, 128, rte_eth_dev_socket_id(dpdk_port_id), NULL, mbuf_pool) < 0) {
         rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup failed\n");
     }
+    printf("rte_eth_dev_socket_id(dpdk_port_id) = %d\n", rte_eth_dev_socket_id(dpdk_port_id));
     if (rte_eth_dev_start(dpdk_port_id) < 0){
         rte_exit(EXIT_FAILURE, "rte_eth_dev_start failed\n");
     }

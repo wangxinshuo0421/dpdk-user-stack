@@ -38,12 +38,13 @@
         exit(EXIT_FAILURE);                                 \
     } while (0)
 
-#define PKT_BURST               32
+#define PKT_BURST               128
 #define MAX_PKT_BURST           32
 #define RX_RING_SIZE            256
 #define TX_RING_SIZE            512
 #define MEMPOOL_CACHE_SIZE      256
 #define MBUF_SIZE               (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
+#define NUM_BUFS                (4096-1)
 #define MAX_RX_QUEUE_PER_LCORE  16
 // #define MAX_TX_QUEUE_PER_PORT   RTE_MAX_ETHPORTS
 #define MAX_TX_QUEUE_PER_PORT   128         // 待定**********
@@ -138,18 +139,6 @@ static const struct rte_eth_txconf tx_conf = {
     .tx_rs_thresh   = 0,
 };
 
-#define CMD_LINE_OPT_NUMA_ON    "numa"
-#define CMD_LINE_OPT_PORTMASK   "portmask"
-#define CMD_LINE_OPT_RX_CONFIG  "config"
-#define CMD_LINE_OPT_HELP       "help"
-static const struct option long_opt[] = {
-    {CMD_LINE_OPT_NUMA_ON, 0, 0, 0},
-    {CMD_LINE_OPT_PORTMASK, 1, 0, 0},
-    {CMD_LINE_OPT_RX_CONFIG, 1, 0, 0},
-    {CMD_LINE_OPT_HELP, 0, 0, 0},
-    {NULL, 0, 0, 0}
-};
-
 
 static uint32_t              enabled_ports_mask = 0;
 static bool                  numa_on = false;
@@ -158,7 +147,10 @@ static uint16_t              nb_txd = TX_DESC_DEFAULT;
 static struct lcore_conf     lcore_conf[RTE_MAX_LCORE];                   /*there may be a problem !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!*/
 static struct rte_mempool   *pktmbuf_pool[NUM_SOCKETS];
 static struct lcore_params   lcore_params_array[MAX_LCORE_PARAMS];
-static struct lcore_params   lcore_params_array_default[] = {{0, 0, 0},};
+static struct lcore_params   lcore_params_array_default[] = {{0, 0, 0},
+                                                             {0, 1, 1},
+                                                             {0, 2, 2},
+                                                             {0, 3, 3}};
 static struct lcore_params  *lcore_params = lcore_params_array_default;
 static uint16_t              n_lcore_parms;
 
@@ -233,7 +225,7 @@ static void print_pkt_addr(int src_ip, int dst_ip, uint16_t src_port, uint16_t d
     b[10] = dst_port & 0xFF;
     b[11] = (dst_port >> 8) & 0xFF;
     dp = ((b[10] << 8) & 0xFF00) | (b[11] & 0x00FF);
-    RTE_LOG(DEBUG, LSI,
+    RTE_LOG(INFO, LSI,
             "CAS: rx udp packet: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%d bytes)\n",
             b[0], b[1], b[2], b[3], sp,
             b[6], b[7], b[8], b[9], dp,
@@ -339,7 +331,9 @@ static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt){
 /*
  * Main per-lcore worker routine.
  */
-static int main_loop(UNUSED void *junk){
+//static int main_loop(UNUSED void *junk){
+static int main_loop(void){
+
     int                socket;
     uint8_t            port,
                        queue;
@@ -368,20 +362,18 @@ static int main_loop(UNUSED void *junk){
                 "CAS: --- lcore = %u port = %u rx_queue = %u ---\n", 
                 lcore_id, port, queue);
     }  
-    printf("in lcore %d; lcore_params: port_id:%d; queue_id:%d; lcore_id:%d \n", 
-            lcore_id, lcore_params[lcore_id].port_id, lcore_params[lcore_id].queue_id, lcore_params[lcore_id].lcore_id);
+
     /* cyclic processing port receive information */
     while (1){
-        for(i = 0; i < 1; i++){
+        for(i = 0; i < conf->n_rx_queue; i++){
             port = conf->rx_queues[i].port_id;
             queue = conf->rx_queues[i].queue_id;
             n_reply = 0;
-            n_rx = rte_eth_rx_burst(port, queue, pkts_burst, PKT_BURST);
-            //printf("rx num = %d; rte_eth_rx_burst port:%d ; queue:%d\n",n_rx, port, queue);
+            n_rx = rte_eth_rx_burst(0, 0, pkts_burst, PKT_BURST);
             if(n_rx == 0)
                 continue;
             for(i = 0; i < n_rx; i++){
-                printf("recv!!!!\n");
+                //printf("recv!!!!\n");
                 pkt = pkts_burst[i];
                 if(echo_single_udp_packet(pkt)){
                     send_one(conf, pkt, port, socket);
@@ -422,19 +414,15 @@ static void init_packet_buffer(unsigned num_mbuf){
     char        s[64];
     unsigned    lcore_id;
 
-    for(lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++){
+    for(lcore_id = 0; lcore_id < n_lcore_parms; lcore_id++){
         if(!rte_lcore_is_enabled(lcore_id)){
             continue;
         }
         socketid = socket_for_lcore(lcore_id);
         if(pktmbuf_pool[socketid] == NULL){
-            pktmbuf_pool[socketid] = rte_mempool_create(s, num_mbuf,
-                                                        MBUF_SIZE, MEMPOOL_CACHE_SIZE,
-                                                        sizeof(struct rte_pktmbuf_pool_private),
-                                                        rte_pktmbuf_pool_init, NULL,
-                                                        rte_pktmbuf_init, NULL,
-                                                        socketid, 0);
-            if(!pktmbuf_pool[socketid]){
+            pktmbuf_pool[socketid] = rte_pktmbuf_pool_create("mbuf pool", MBUF_SIZE,MEMPOOL_CACHE_SIZE, 
+                                                            0, RTE_MBUF_DEFAULT_BUF_SIZE,rte_socket_id());
+            if(pktmbuf_pool[socketid] == NULL){
                 DIE("CAS: failed to allocate mbuf pool on socket %d\n", socketid);
             }
         }
@@ -451,7 +439,7 @@ static void init_tx_queue_for_port(uint8_t port){
     struct lcore_conf  *queue_conf;
 
     queue = 0;
-    for(lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++){
+    for(lcore_id = 0; lcore_id < n_lcore_parms; lcore_id++){
         if(!rte_lcore_is_enabled(lcore_id)){
             continue;
         }
@@ -505,7 +493,6 @@ static void init_lcores(void){
     for(i = 0; i < n_lcore_parms; i++){
         lcore = lcore_params[i].lcore_id;
         n_rx_queue = lcore_conf[lcore].n_rx_queue;
-        printf("DEBUG: lcore id = %d ; n_rx_queue = %d \n", lcore, n_rx_queue);
         if(n_rx_queue >= MAX_RX_QUEUE_PER_LCORE){
             DIE("CAS: too man RX queues (%u) for lcore %u\n", (unsigned) n_rx_queue + 1, (unsigned) lcore);
         }
@@ -513,6 +500,7 @@ static void init_lcores(void){
         lcore_conf[lcore].rx_queues[n_rx_queue].port_id = lcore_params[i].port_id;
         lcore_conf[lcore].rx_queues[n_rx_queue].queue_id = lcore_params[i].queue_id;
         lcore_conf[lcore].n_rx_queue = 1;
+        printf("DEBUG: lcore id = %d ; n_rx_queue = %d \n", lcore, lcore_conf[lcore].n_rx_queue);
     }
 }
 
@@ -528,13 +516,8 @@ static void configure_ports(unsigned n_ports, uint32_t port_mask, uint32_t n_lco
     struct rte_ether_addr   eth_addr;
 
     for(port_id = 0; port_id < n_ports; port_id++){
-        // if(!(port_mask & (1 << port_id))){
-        //     RTE_LOG(INFO, LSI,
-        //             "CAS: skipping disabled port %u\n", port_id);
-        //     continue;
-        // }
-        n_rx_queue = 1;
-        n_tx_queue = 1;         // change there: n_tx_queue = n_lcore;
+        n_rx_queue = 4;
+        n_tx_queue = 4;         // change there: n_tx_queue = n_lcore;
         if(n_tx_queue > MAX_TX_QUEUE_PER_PORT){
             n_tx_queue = MAX_TX_QUEUE_PER_PORT;
         }
@@ -552,9 +535,10 @@ static void configure_ports(unsigned n_ports, uint32_t port_mask, uint32_t n_lco
                 eth_addr.addr_bytes[2], eth_addr.addr_bytes[3], 
                 eth_addr.addr_bytes[4], eth_addr.addr_bytes[5]);
         init_packet_buffer(NUM_MBUF(n_ports, n_rx_queue, n_tx_queue, n_lcores));
+
         init_tx_queue_for_port(port_id);
     }
-    RTE_LOG(INFO, LSI, "CAS: function configure_ports excute, n_port = %d, port_id = %u\n", n_ports, port_id);
+    RTE_LOG(INFO, LSI, "CAS: function configure_ports have excuted, n_port = %d, port_id = %u\n", n_ports, port_id);
 }
 
 /*
@@ -579,7 +563,7 @@ static void init_rx_queues(void){
         RTE_LOG(INFO, LSI,
                 "CAS: initializing RX queue on lcore %u, n_rx_queue = % d\n",
                 lcore_id, lconf->n_rx_queue);
-        for(queue = 0; queue < 1; queue++){
+        for(queue = 0; queue < lconf->n_rx_queue; queue++){
             port_id = lconf->rx_queues[queue].port_id;
             queue_id = lconf->rx_queues[queue].queue_id;
             RTE_LOG(INFO, LSI,
@@ -601,9 +585,9 @@ static void start_ports(unsigned n_ports, uint32_t port_mask){
     uint8_t port_id;
 
     for(port_id = 0; port_id < n_ports; port_id++){
-        if(!(port_mask & (1 << port_id))){
-            continue;
-        }
+        // if(!(port_mask & (1 << port_id))){
+        //     continue;
+        // }
         rte_eth_promiscuous_enable(port_id);
         if((rsv = rte_eth_dev_start(port_id)) < 0){
             DIE("CAS: RTE eth dev start failed: err = %d; port = %d\n", rsv, port_id);
@@ -679,15 +663,15 @@ static void init_nics(void){
     check_port_link_status(n_ports, enabled_ports_mask);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv){
     /* code */
     if (rte_eal_init(argc, argv) < 0) {
-        rte_exit(EXIT_FAILURE, "Error with eal init \n");
+        rte_exit(EXIT_FAILURE, "init eal failed\n");
     }
     n_lcore_parms = rte_lcore_count();
     init_nics();
-    rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
-    rte_eal_mp_wait_lcore();
+    main_loop();
+    // rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
+    // rte_eal_mp_wait_lcore();
     return 0;
 }
