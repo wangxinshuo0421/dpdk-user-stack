@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <getopt.h>
 
 #include <rte_config.h>
 #include <rte_byteorder.h>
@@ -221,46 +220,6 @@ static INLINE uint8_t socket_for_lcore(unsigned lcore_id){
 }
 
 /*
- * Do incremental addition to one's compliment sum in @start.
- */
-static inline uint32_t csum_partial(const uint16_t *p, uint16_t size, uint32_t start){
-    uint32_t sum = start;
-    while (size > 1){
-        sum += *p;
-        size -= sizeof(uint16_t);
-        p++;
-    }
-    if(size){
-        sum += *((const uint8_t *) p);
-    }
-    return sum;
-}
-
-/*
- * Fold 32-bit @x one's compliment sum into 16-bit value.
- */
-static inline uint16_t csum_fold(uint32_t x){
-    x = (x & 0x0000FFFF) + (x >> 16);
-    x = (x & 0x0000FFFF) + (x >> 16);
-    return (uint16_t) x;
-}
-
-/*
- * Compute checksum of IPv4 pseudo-header.
- */
-uint16_t ipv4_pseudo_csum(struct rte_ipv4_hdr *ip){
-    struct psd_hdr psd;
-
-    psd.src_addr = ip->src_addr;
-    psd.dst_addr = ip->dst_addr;
-    psd.zero = 0;
-    psd.proto = ip->next_proto_id;
-    psd.len = rte_cpu_to_be_16(
-        rte_be_to_cpu_16(ip->total_length) - (int)((ip->version_ihl & 0x0F) * 4u));
-    return csum_fold(csum_partial((uint16_t *) &psd, sizeof(psd), 0));
-}
-
-/*
  * Print a packet information
  */
 static void print_pkt(uint8_t src_ip, int dst_ip, 
@@ -286,7 +245,7 @@ static void print_pkt(uint8_t src_ip, int dst_ip,
     b[10] = dst_port & 0xFF;
     b[11] = (dst_port >> 8) & 0xFF;
     dp = ((b[10] << 8) & 0xFF00) | (b[11] & 0x00FF);
-    *(char *)(udp_hdr + ntohs(udp_hdr->dgram_len)) = '\0';
+    *(char *)(udp_hdr + rte_be_to_cpu_16(udp_hdr->dgram_len)) = '\0';
     if((sp == 10000 || sp == 60000))
         RTE_LOG(INFO, LSI,
             "CAS: lcore_id = %d rx udp packet: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%d bytes) data: %s\n",
@@ -295,7 +254,45 @@ static void print_pkt(uint8_t src_ip, int dst_ip,
             b[6], b[7], b[8], b[9], dp,
             len, (char *)(udp_hdr + 1));
 }
+/*
+* function: calculate a udp packet checksum.
+* input:    packet src ip and dst ip big end (network order) ;
+*           need to be calculated udp head.
+* output:   a right checksum (16bit, cpu order)
+*/
+rte_le16_t calculate_udp_checksum(rte_be32_t src_ip, rte_be32_t dst_ip, struct rte_udp_hdr *udp_hdr){
+    unsigned int    cksum = 0;
+    rte_be16_t      udp_len = udp_hdr -> dgram_len;
+    unsigned short *tmp = (unsigned short *) (udp_hdr + 1);                   // extract data section
+    uint16_t        data_len = rte_be_to_cpu_16(udp_hdr -> dgram_len) - 8;    // 8 is udp head length
 
+    /* calculate pseudo-ip-head sum */
+    cksum = ((src_ip >> 16) & 0xffff) + (src_ip & 0xffff);          // src ip
+    cksum = ((dst_ip >> 16) & 0xffff) + (dst_ip & 0xffff) + cksum;  // dst ip
+    cksum += 0x0011;                 // 0 complement ;  11 -> udp protocol number
+    cksum += udp_len;                // udp length
+
+    /* calculate udp head sum */
+    cksum += udp_hdr -> src_port;    // src port
+    cksum += udp_hdr -> dst_port;    // dst port
+    cksum += 0x0000;                 // check sum
+    cksum += udp_len;                // udp length  ps: twice udp length is right
+
+    printf("tmp : ");
+    /* calculate udp data sum */
+    while (data_len > 1) {
+        printf("%u ", *tmp);
+        cksum += *tmp++;
+        data_len -= 2;
+    }
+    printf("%u\n",(*tmp));
+    if (data_len)
+        cksum += (*tmp) & 0xff00;
+    while (cksum >> 16)
+        cksum = (cksum >> 16) + (cksum & 0xffff);
+    
+    return (rte_le16_t)(~cksum);
+}
 /*
  * Send a number of packets out the specified port (Ethernet device).
  */
@@ -327,9 +324,8 @@ static inline int send_burst(struct lcore_conf *conf, uint16_t n, uint8_t port, 
  * This will send a burst of packets out if the TX buffer is full.
  */
 static inline int build_one_udp(struct lcore_conf *conf, uint8_t port, int socket,
-                                uint16_t src_port, uint16_t dst_port, const char *data,
+                                uint16_t src_port, uint16_t dst_port, const char *data, uint16_t data_len,
                                 uint32_t dst_ip, struct rte_ether_addr next_mac){
-    uint16_t                data_len;
     uint16_t                len;
     struct rte_ether_hdr   *eth_hdr;
     struct rte_ipv4_hdr    *ip_hdr;
@@ -340,7 +336,6 @@ static inline int build_one_udp(struct lcore_conf *conf, uint8_t port, int socke
     if(buf == NULL)
         RTE_LOG(INFO, LSI, "send pktmbufs alloc failed\n");
     
-    data_len = sizeof(data);            
     char *pkt_addr = rte_pktmbuf_append(buf, data_len);
     if (pkt_addr == NULL)
         return -1;
@@ -351,7 +346,7 @@ static inline int build_one_udp(struct lcore_conf *conf, uint8_t port, int socke
     udp_hdr->src_port = rte_cpu_to_be_16(src_port);
     udp_hdr->dst_port = rte_cpu_to_be_16(dst_port);
     udp_hdr->dgram_len = rte_cpu_to_be_16(data_len + sizeof(struct rte_udp_hdr));
-    udp_hdr->dgram_cksum = 0;               // checksum here !!!!!!!!!!!!!!
+    udp_hdr->dgram_cksum = 0;               
 
     /* add the ip head */
     ip_hdr = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(buf, sizeof(struct rte_ipv4_hdr));
@@ -361,6 +356,10 @@ static inline int build_one_udp(struct lcore_conf *conf, uint8_t port, int socke
     ip_hdr->dst_addr = rte_cpu_to_be_32(dst_ip);
     ip_hdr->src_addr = local_ip;
     ip_hdr->time_to_live = 128;
+    ip_hdr->hdr_checksum = 0;
+
+    /* add check sum */
+    udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
     ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
     /* add the ether head , the ether frame has no CRC*/
@@ -375,6 +374,9 @@ static inline int build_one_udp(struct lcore_conf *conf, uint8_t port, int socke
     if(unlikely(len == MAX_TX_BURST)){
         RTE_LOG(INFO, LSI, "send queue has full, auto transport now\n");
         send_burst(conf, MAX_TX_BURST, port, socket);
+        len = 0;
+    }else{
+        send_burst(conf, len, port, socket);
         len = 0;
     }
     conf->tx_mbufs[port].len = len;
@@ -417,7 +419,7 @@ static INLINE int echo_single_packet(uint8_t port_id, int socket, struct rte_mbu
                            checksum = 99;
     uint32_t               ip_addr;
     struct rte_udp_hdr    *udp_h;
-    struct rte_ipv4_hdr  *ip_h;
+    struct rte_ipv4_hdr   *ip_h;
     struct rte_vlan_hdr   *vlan_h;
     struct rte_ether_hdr  *eth_h;
     struct rte_ether_addr  eth_addr;
@@ -425,15 +427,7 @@ static INLINE int echo_single_packet(uint8_t port_id, int socket, struct rte_mbu
     eth_h = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
     eth_type = rte_be_to_cpu_16(eth_h->ether_type);
     l2_len = sizeof(*eth_h);
-
-    // printf("Mac: from: %02x:%02x:%02x:%02x:%02x:%02x;  ",
-    //                    eth_h->s_addr.addr_bytes[0], eth_h->s_addr.addr_bytes[1],
-    //                    eth_h->s_addr.addr_bytes[2], eth_h->s_addr.addr_bytes[3],
-    //                    eth_h->s_addr.addr_bytes[4], eth_h->s_addr.addr_bytes[5]);
-    // printf("to: %02x:%02x:%02x:%02x:%02x:%02x; \n",
-    //             eth_h->d_addr.addr_bytes[0], eth_h->d_addr.addr_bytes[1],
-    //             eth_h->d_addr.addr_bytes[2], eth_h->d_addr.addr_bytes[3],
-    //             eth_h->d_addr.addr_bytes[4], eth_h->d_addr.addr_bytes[5]);    
+   
     /* ARP */
 #if ARP_IS_ENABLE
     if (eth_type == RTE_ETHER_TYPE_ARP){
@@ -460,31 +454,15 @@ static INLINE int echo_single_packet(uint8_t port_id, int socket, struct rte_mbu
         RTE_LOG(DEBUG, LSI, 
                 "CAS: receive tcp packet, can't handle it\n");
         return 0;
+    }else{
+        udp_h = (struct rte_udp_hdr *) ((char *) ip_h + sizeof(*ip_h));
+        // RTE_LOG(INFO, LSI, "recv cksum = %u ; calculate cksum = %u\n", 
+        //                     rte_be_to_cpu_16(udp_h->dgram_cksum),
+        //                     rte_ipv4_udptcp_cksum(ip_h, udp_h));
+        print_pkt(ip_h->src_addr, ip_h->dst_addr, udp_h->src_port, udp_h->dst_port, 
+                udp_h, pkt->data_len, lcore_id);
     }
-    udp_h = (struct rte_udp_hdr *) ((char *) ip_h + sizeof(*ip_h));
-    print_pkt(ip_h->src_addr, ip_h->dst_addr, udp_h->src_port, udp_h->dst_port, 
-               udp_h, pkt->data_len, lcore_id);
     
-    /* swap the source and destination addresses/ports */
-    // rte_ether_addr_copy(&eth_h->s_addr, &eth_addr);
-    // rte_ether_addr_copy(&eth_h->d_addr, &eth_h->s_addr);
-    // rte_ether_addr_copy(&eth_addr, &eth_h->d_addr);
-    // ip_addr = ip_h->src_addr;
-    // ip_h->src_addr = ip_h->dst_addr;
-    // ip_h->dst_addr = host_ip;
-    // udp_port = udp_h->src_port;
-    // udp_h->src_port = udp_h->dst_port;
-    // udp_h->dst_port = udp_port;
-    // /* set checksum parameters for HW offload */
-    // pkt->ol_flags |= (PKT_TX_IP_CKSUM | PKT_TX_UDP_CKSUM);
-    // ip_h->hdr_checksum = 0;
-    // checksum = rte_cpu_to_be_16(rte_ipv4_cksum(ip_h));
-    // ip_h->hdr_checksum = checksum;
-    // //udp_h->dgram_cksum = ipv4_pseudo_csum(ip_h);
-    // udp_h->dgram_cksum = 0x62aa;
-    // RTE_LOG(INFO, LSI,
-    //         "udp_h check sum = %u ;  \n",
-    //          udp_h->dgram_cksum);
     return 1;
 }
 
@@ -544,7 +522,7 @@ static int main_loop(void){
                     next_mac_addr.addr_bytes[4] = 0x00;
                     next_mac_addr.addr_bytes[5] = 0x01;
                     build_one_udp(conf, port, socket,
-                                  60000, 10000, "recv!",
+                                  60000, 10000, "recv!", 5,
                                   0xc0a82f01, next_mac_addr);
                 }
                 rte_pktmbuf_free(pkt);
@@ -584,7 +562,7 @@ static void init_packet_buffer(unsigned num_mbuf){
         socketid = socket_for_lcore(lcore_id);
         if(pktmbuf_pool[socketid] == NULL){
             pktmbuf_pool[socketid] = rte_pktmbuf_pool_create("mbuf pool", MBUF_SIZE,MEMPOOL_CACHE_SIZE, 
-                                                            0, RTE_MBUF_DEFAULT_BUF_SIZE,rte_socket_id());
+                                                             0, RTE_MBUF_DEFAULT_BUF_SIZE,rte_socket_id());
             
             if(pktmbuf_pool[socketid] == NULL){
                 DIE("CAS: failed to allocate mbuf pool on socket %d\n", socketid);
