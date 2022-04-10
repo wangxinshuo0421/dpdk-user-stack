@@ -34,12 +34,13 @@
 
 #define DIE(msg, ...)                                       \
     do {                                                    \
-        RTE_LOG(ERR, USER1, msg , ## __VA_ARGS__ );         \
+        RTE_LOG(ERR, LSI, msg , ## __VA_ARGS__ );         \
         exit(EXIT_FAILURE);                                 \
     } while (0)
 
 #define PKT_BURST               128
 #define MAX_PKT_BURST           32
+#define MAX_TX_BURST            32
 #define RX_RING_SIZE            256
 #define TX_RING_SIZE            512
 #define MEMPOOL_CACHE_SIZE      256
@@ -54,6 +55,12 @@
 #define TX_DESC_DEFAULT         512
 #define MAX_LCORE_PARAMS        1024
 #define BURST_TX_DRAIN_US       100
+
+/* protocol enable */
+#define ARP_IS_ENABLE 0
+#define UDP_IS_ENABLE 1
+#define TCP_IS_ENABLE 0
+
 
 #define NUM_MBUF(ports, rx, tx, lcores)                 \
     RTE_MAX((ports * rx * RX_DESC_DEFAULT +             \
@@ -94,24 +101,7 @@ struct psd_hdr{
     uint16_t len;
 }  __rte_packed;         //不对齐
 
-/**
- * IPv4 Header
- */
-struct rte_ipv4_h6dr {
-	uint8_t  version_ihl;		/**< version and header length */
-	uint8_t  type_of_service;	/**< type of service */
-	rte_be16_t total_length;	/**< length of packet */
-	rte_be16_t packet_id;		/**< packet ID */
-	rte_be16_t fragment_offset;	/**< fragmentation offset */
-	uint8_t  time_to_live;		/**< time to live */
-	uint8_t  next_proto_id;		/**< protocol ID */
-	rte_be16_t hdr_checksum;	/**< header checksum */
-	rte_be32_t src_addr;		/**< source address */
-	rte_be32_t dst_addr;		/**< destination address */
-} __rte_packed;
-
-static uint8_t intel_rss_key[40] =
-{
+static uint8_t intel_rss_key[40] = {
     0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
     0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
     0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
@@ -176,6 +166,52 @@ static struct lcore_params   lcore_params_array_default[] = {{0, 0, 0},
                                                              {0, 3, 3}};
 static struct lcore_params  *lcore_params = lcore_params_array_default;
 static uint16_t              n_lcore_parms;
+static uint32_t              local_ip = 0x802FA8C0;     // LOCAL IP : 192.168.47.128 big-endian
+static uint32_t              host_ip = 0x012FA8C0;      // LOCAL IP : 192.168.47.1 big-endian
+static struct rte_ether_addr local_mac;
+
+/* ========================= ETHERNET LAYER ========================================= */
+/* =========================  ARP PROTOCOL  ========================================= */
+
+#if ARP_IS_ENABLE
+/*
+ * build a arp packet for broadcast
+ */
+static struct rte_mbuf *build_arp_pkt(uint8_t port_id, struct rte_mbuf *mbuf, 
+                                     uint8_t *dst_mac, uint32_t sip, uint32_t dip) {
+
+	const unsigned total_length = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
+
+	mbuf->pkt_len = total_length;
+	mbuf->data_len = total_length;
+
+	uint8_t *pkt_data = rte_pktmbuf_mtod(mbuf, uint8_t *);    	
+    /* 1 ethhdr */
+	struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt_data;
+    struct rte_ether_hdr *eth_s_addr;
+    rte_eth_macaddr_get(port_id, &eth_s_addr);
+    uint8_t *src_mac = eth_s_addr->s_addr.addr_bytes; 
+	rte_memcpy(eth->s_addr.addr_bytes, src_mac, RTE_ETHER_ADDR_LEN);
+	rte_memcpy(eth->d_addr.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+	eth->ether_type = htons(RTE_ETHER_TYPE_ARP);
+
+	/* 2 arp */ 
+	struct rte_arp_hdr *arp = (struct rte_arp_hdr *)(eth + 1);
+	arp->arp_hardware = htons(1);
+	arp->arp_protocol = htons(RTE_ETHER_TYPE_IPV4);
+	arp->arp_hlen = RTE_ETHER_ADDR_LEN;
+	arp->arp_plen = sizeof(uint32_t);
+	arp->arp_opcode = htons(2);
+
+	rte_memcpy(arp->arp_data.arp_sha.addr_bytes, src_mac, RTE_ETHER_ADDR_LEN);
+	rte_memcpy(arp->arp_data.arp_tha.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+
+	arp->arp_data.arp_sip = sip;
+	arp->arp_data.arp_tip = dip;
+	
+	return mbuf;
+}
+#endif
 
 /*
  * Return the CPU socket on which the given logical core resides.
@@ -212,7 +248,7 @@ static inline uint16_t csum_fold(uint32_t x){
 /*
  * Compute checksum of IPv4 pseudo-header.
  */
-uint16_t ipv4_pseudo_csum(struct rte_ipv4_h6dr *ip){
+uint16_t ipv4_pseudo_csum(struct rte_ipv4_hdr *ip){
     struct psd_hdr psd;
 
     psd.src_addr = ip->src_addr;
@@ -225,10 +261,9 @@ uint16_t ipv4_pseudo_csum(struct rte_ipv4_h6dr *ip){
 }
 
 /*
- * We can't include arpa/inet.h because our compiler options are too strict
- * for that shitty code. Thus, we have to do this here...
+ * Print a packet information
  */
-static void print_pkt(int src_ip, int dst_ip, 
+static void print_pkt(uint8_t src_ip, int dst_ip, 
                       uint16_t src_port, uint16_t dst_port, 
                       struct rte_udp_hdr * udp_hdr,
                       int len, int lcore_id)
@@ -270,13 +305,17 @@ static inline int send_burst(struct lcore_conf *conf, uint16_t n, uint8_t port, 
     struct rte_mbuf  **m_table;
 
     queueid = conf->tx_queue_ids[port];
+    //printf("send queue id = %d\n", queueid);
     m_table = (struct rte_mbuf **) conf->tx_mbufs[port].m_table;
     rsv = rte_eth_tx_burst(port, queueid, m_table, n);
-    if(unlikely(rsv < n)){                      // Compiler acceleration
-        do{
+    if(unlikely(rsv < n)){                      // unlikely for compiler acceleration
+        do{ 
+            RTE_LOG(INFO, LSI, "something wrong in send queue\n");
             rte_pktmbuf_free(m_table[rsv]);
         }while(++rsv < n);
     }
+    for(uint8_t i = 0; i < n; i++)
+        rte_pktmbuf_free(conf->tx_mbufs[port].m_table[i]);
     // RTE_LOG(DEBUG, LSI, 
     //         "CAS: free count mempool socket %u: %u\n", 
     //         socket, rte_mempool_free_count(pktmbuf_pool[socket]));
@@ -284,17 +323,58 @@ static inline int send_burst(struct lcore_conf *conf, uint16_t n, uint8_t port, 
 }
 
 /*
- * Queue a single packet for transmit through a given port (Ethernet device).
+ * Build and queue a single packet for transmit through a given port (Ethernet device).
  * This will send a burst of packets out if the TX buffer is full.
  */
-static inline int send_one(struct lcore_conf *conf, struct rte_mbuf *pkt, uint8_t port, int socket){
-    uint16_t len;
+static inline int build_one_udp(struct lcore_conf *conf, uint8_t port, int socket,
+                                uint16_t src_port, uint16_t dst_port, const char *data,
+                                uint32_t dst_ip, struct rte_ether_addr next_mac){
+    uint16_t                data_len;
+    uint16_t                len;
+    struct rte_ether_hdr   *eth_hdr;
+    struct rte_ipv4_hdr    *ip_hdr;
+    struct rte_udp_hdr     *udp_hdr;
+    struct rte_mbuf        *buf;
 
+    buf = rte_pktmbuf_alloc(pktmbuf_pool[0]);
+    if(buf == NULL)
+        RTE_LOG(INFO, LSI, "send pktmbufs alloc failed\n");
+    
+    data_len = sizeof(data);            
+    char *pkt_addr = rte_pktmbuf_append(buf, data_len);
+    if (pkt_addr == NULL)
+        return -1;
+    rte_memcpy(pkt_addr, data, data_len);
+
+    /* add udp head */
+    udp_hdr = (struct rte_udp_hdr *)rte_pktmbuf_prepend(buf, sizeof(struct rte_udp_hdr));
+    udp_hdr->src_port = rte_cpu_to_be_16(src_port);
+    udp_hdr->dst_port = rte_cpu_to_be_16(dst_port);
+    udp_hdr->dgram_len = rte_cpu_to_be_16(data_len + sizeof(struct rte_udp_hdr));
+    udp_hdr->dgram_cksum = 0;               // checksum here !!!!!!!!!!!!!!
+
+    /* add the ip head */
+    ip_hdr = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(buf, sizeof(struct rte_ipv4_hdr));
+    ip_hdr->version_ihl = 0x45;             // ip version
+    ip_hdr->total_length = rte_cpu_to_be_16(data_len + 8 + sizeof(struct rte_ipv4_hdr));
+    ip_hdr->next_proto_id = 0x11;           // next protocol is udp = 17
+    ip_hdr->dst_addr = rte_cpu_to_be_32(dst_ip);
+    ip_hdr->src_addr = local_ip;
+    ip_hdr->time_to_live = 128;
+    ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+
+    /* add the ether head , the ether frame has no CRC*/
+    eth_hdr = (struct rte_ether_hdr *)rte_pktmbuf_prepend(buf, sizeof(struct rte_ether_hdr));
+    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    rte_ether_addr_copy(&local_mac, &eth_hdr->s_addr);
+    rte_ether_addr_copy(&next_mac, &eth_hdr->d_addr);
+    
     len = conf->tx_mbufs[port].len;
-    conf->tx_mbufs[port].m_table[len] = pkt;
+    conf->tx_mbufs[port].m_table[len] = buf;
     len++;
-    if(unlikely(len == MAX_PKT_BURST)){
-        send_burst(conf, MAX_PKT_BURST, port, socket);
+    if(unlikely(len == MAX_TX_BURST)){
+        RTE_LOG(INFO, LSI, "send queue has full, auto transport now\n");
+        send_burst(conf, MAX_TX_BURST, port, socket);
         len = 0;
     }
     conf->tx_mbufs[port].len = len;
@@ -302,15 +382,42 @@ static inline int send_one(struct lcore_conf *conf, struct rte_mbuf *pkt, uint8_
 }
 
 /*
- * Echoes back a single UDP packet to its origin.
+ *  handle a arp packet 
  */
-static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt, int lcore_id){
+static INLINE void arp_pkt_handle(uint8_t port_id, int socket, struct rte_mbuf *pkt, int lcore_id){
+    /* the pkt is arp protocol, transport arp head (big endian) */       
+    struct rte_arp_hdr *arp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ether_hdr *, sizeof(struct rte_ether_hdr));
+    struct lcore_conf *conf;    
+    conf = &lcore_conf[lcore_id];
+    /* print arp msg */
+    printf("arp ---> dst: %u; \n", arp_hdr->arp_data.arp_tip);
+    if (arp_hdr->arp_data.arp_tip == local_ip){
+        printf("i am in now!\n");
+        /* make and give a arp response */
+        struct rte_mbuf   *arp_pkt;
+        arp_pkt = rte_pktmbuf_alloc(pktmbuf_pool[socket]);
+        if (!arp_pkt)   rte_exit(EXIT_FAILURE, "rte_pktmbuf_alloc \n");
+        struct rte_mbuf *arpbuf = build_arp_pkt(port_id, arp_pkt, arp_hdr->arp_data.arp_sha.addr_bytes,
+                                                arp_hdr->arp_data.arp_tip, arp_hdr->arp_data.arp_sip); 
+        printf("already build alloc\n");
+        // send_one(conf, arp_pkt, port_id, socket);
+        // send_burst(conf, conf->tx_mbufs[port_id].len, port_id, socket);
+        // rte_pktmbuf_free(arp_pkt);
+    }
+    return;
+}
+
+/*
+ * Echoes back a single packet to its origin.
+ */
+static INLINE int echo_single_packet(uint8_t port_id, int socket, struct rte_mbuf *pkt, int lcore_id){
     int                    l2_len;
     uint16_t               eth_type,
-                           udp_port;
+                           udp_port,
+                           checksum = 99;
     uint32_t               ip_addr;
     struct rte_udp_hdr    *udp_h;
-    struct rte_ipv4_h6dr  *ip_h;
+    struct rte_ipv4_hdr  *ip_h;
     struct rte_vlan_hdr   *vlan_h;
     struct rte_ether_hdr  *eth_h;
     struct rte_ether_addr  eth_addr;
@@ -318,6 +425,22 @@ static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt, int lcore_id){
     eth_h = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
     eth_type = rte_be_to_cpu_16(eth_h->ether_type);
     l2_len = sizeof(*eth_h);
+
+    // printf("Mac: from: %02x:%02x:%02x:%02x:%02x:%02x;  ",
+    //                    eth_h->s_addr.addr_bytes[0], eth_h->s_addr.addr_bytes[1],
+    //                    eth_h->s_addr.addr_bytes[2], eth_h->s_addr.addr_bytes[3],
+    //                    eth_h->s_addr.addr_bytes[4], eth_h->s_addr.addr_bytes[5]);
+    // printf("to: %02x:%02x:%02x:%02x:%02x:%02x; \n",
+    //             eth_h->d_addr.addr_bytes[0], eth_h->d_addr.addr_bytes[1],
+    //             eth_h->d_addr.addr_bytes[2], eth_h->d_addr.addr_bytes[3],
+    //             eth_h->d_addr.addr_bytes[4], eth_h->d_addr.addr_bytes[5]);    
+    /* ARP */
+#if ARP_IS_ENABLE
+    if (eth_type == RTE_ETHER_TYPE_ARP){
+        arp_pkt_handle(port_id, socket, pkt, lcore_id);
+        return 1;
+    }
+#endif
     /* frames in VPC come in with ethertype 0x8100, i.e. they are 802.1q VLAN tagged */
     /* VLAN */
     if(eth_type == RTE_ETHER_TYPE_VLAN){
@@ -331,7 +454,7 @@ static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt, int lcore_id){
                 "CAS: receive ipv6 packet, can't handle it\n");
         return 0;
     }
-    ip_h = (struct rte_ipv4_h6dr *) ((char *) eth_h + l2_len);
+    ip_h = (struct rte_ipv4_hdr *) ((char *) eth_h + l2_len);
     /* only support udp !!!!*/
     if(ip_h -> next_proto_id != IPPROTO_UDP){
         RTE_LOG(DEBUG, LSI, 
@@ -341,20 +464,27 @@ static INLINE int echo_single_udp_packet(struct rte_mbuf *pkt, int lcore_id){
     udp_h = (struct rte_udp_hdr *) ((char *) ip_h + sizeof(*ip_h));
     print_pkt(ip_h->src_addr, ip_h->dst_addr, udp_h->src_port, udp_h->dst_port, 
                udp_h, pkt->data_len, lcore_id);
+    
     /* swap the source and destination addresses/ports */
-    rte_ether_addr_copy(&eth_h->s_addr, &eth_addr);
-    rte_ether_addr_copy(&eth_h->d_addr, &eth_h->s_addr);
-    rte_ether_addr_copy(&eth_addr, &eth_h->d_addr);
-    ip_addr = ip_h->src_addr;
-    ip_h->src_addr = ip_h->dst_addr;
-    ip_h->dst_addr = ip_addr;
-    udp_port = udp_h->src_port;
-    udp_h->src_port = udp_h->dst_port;
-    udp_h->dst_port = udp_port;
-    /* set checksum parameters for HW offload */
-    pkt->ol_flags |= (PKT_TX_IP_CKSUM | PKT_TX_UDP_CKSUM);
-    ip_h->hdr_checksum = 0;
-    udp_h->dgram_cksum = ipv4_pseudo_csum(ip_h);
+    // rte_ether_addr_copy(&eth_h->s_addr, &eth_addr);
+    // rte_ether_addr_copy(&eth_h->d_addr, &eth_h->s_addr);
+    // rte_ether_addr_copy(&eth_addr, &eth_h->d_addr);
+    // ip_addr = ip_h->src_addr;
+    // ip_h->src_addr = ip_h->dst_addr;
+    // ip_h->dst_addr = host_ip;
+    // udp_port = udp_h->src_port;
+    // udp_h->src_port = udp_h->dst_port;
+    // udp_h->dst_port = udp_port;
+    // /* set checksum parameters for HW offload */
+    // pkt->ol_flags |= (PKT_TX_IP_CKSUM | PKT_TX_UDP_CKSUM);
+    // ip_h->hdr_checksum = 0;
+    // checksum = rte_cpu_to_be_16(rte_ipv4_cksum(ip_h));
+    // ip_h->hdr_checksum = checksum;
+    // //udp_h->dgram_cksum = ipv4_pseudo_csum(ip_h);
+    // udp_h->dgram_cksum = 0x62aa;
+    // RTE_LOG(INFO, LSI,
+    //         "udp_h check sum = %u ;  \n",
+    //          udp_h->dgram_cksum);
     return 1;
 }
 
@@ -403,18 +533,21 @@ static int main_loop(void){
             if(n_rx == 0)
                 continue;
             for(i = 0; i < n_rx; i++){
-                //printf("recv!!!!\n");
                 pkt = pkts_burst[i];
-                if(echo_single_udp_packet(pkt, lcore_id)){
-                    send_one(conf, pkt, port, socket);
-                    n_reply++;
-                } 
+                if(echo_single_packet(port, socket, pkt, lcore_id)){
+                    //send_one(conf, pkt, port, socket);
+                    struct rte_ether_addr next_mac_addr;
+                    next_mac_addr.addr_bytes[0] = 0x00;
+                    next_mac_addr.addr_bytes[1] = 0x50;
+                    next_mac_addr.addr_bytes[2] = 0x56;
+                    next_mac_addr.addr_bytes[3] = 0xc0;
+                    next_mac_addr.addr_bytes[4] = 0x00;
+                    next_mac_addr.addr_bytes[5] = 0x01;
+                    build_one_udp(conf, port, socket,
+                                  60000, 10000, "recv!",
+                                  0xc0a82f01, next_mac_addr);
+                }
                 rte_pktmbuf_free(pkt);
-                
-            }
-            if(n_reply > 0){
-                send_burst(conf, conf->tx_mbufs[port].len, port, socket);
-                conf->tx_mbufs[port].len = 0;
             }
         }
     }
@@ -689,6 +822,7 @@ static void init_nics(void){
     RTE_LOG(INFO, LSI,
             "%u Ethernet ports detected\n", n_ports);
     configure_ports(n_ports, enabled_ports_mask, rte_lcore_count());
+    rte_eth_macaddr_get(0, &local_mac);     // nic only have port 0, so write port 0;
     init_rx_queues();
     start_ports(n_ports, enabled_ports_mask);
     check_port_link_status(n_ports, enabled_ports_mask);
