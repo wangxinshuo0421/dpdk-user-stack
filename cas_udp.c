@@ -222,7 +222,7 @@ static INLINE uint8_t socket_for_lcore(unsigned lcore_id){
 /*
  * Print a packet information
  */
-static void print_pkt(uint8_t src_ip, int dst_ip, 
+static void print_pkt(uint32_t src_ip, uint32_t dst_ip, 
                       uint16_t src_port, uint16_t dst_port, 
                       struct rte_udp_hdr * udp_hdr,
                       int len, int lcore_id)
