@@ -5,7 +5,7 @@
 APP = userStack
 
 # all source are stored in SRCS-y
-SRCS-y := test.c
+SRCS-y := cas_udp.c cas_dev_config.c
 
 PKGCONF ?= pkg-config
 
